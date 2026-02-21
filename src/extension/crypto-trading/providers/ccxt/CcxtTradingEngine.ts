@@ -213,6 +213,17 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
       const params: Record<string, unknown> = {};
       if (order.reduceOnly) params.reduceOnly = true;
 
+      // Snapshot unrealized PnL before close for realized PnL calculation
+      let preCloseUnrealizedPnL: number | null = null;
+      if (order.reduceOnly) {
+        try {
+          const prePositions = await this.exchange.fetchPositions();
+          preCloseUnrealizedPnL = prePositions
+            .filter(p => Math.abs(parseFloat(String(p.contracts ?? 0))) > 0)
+            .reduce((sum, p) => sum + parseFloat(String(p.unrealizedPnl ?? 0)), 0);
+        } catch { /* best-effort */ }
+      }
+
       const ccxtOrder = await this.exchange.createOrder(
         ccxtSymbol,
         order.type,
@@ -235,11 +246,18 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
         try {
           // Fetch fresh positions to update unrealized snapshot
           const freshPositions = await this.getPositions(); // side-effect: updates updateUnrealizedPnL
-          // Record realized PnL: use ccxt order cost as proxy (fee from the fill)
-          // Since we can't get entry price from order alone, use the fee as a conservative realized loss
+          // Compute realized PnL = pre-close unrealized - post-close unrealized
+          // The difference is what was "realized" by closing the position
+          if (preCloseUnrealizedPnL !== null) {
+            const postUnrealized = freshPositions.reduce((sum, p) => sum + p.unrealizedPnL, 0);
+            const realizedPnL = preCloseUnrealizedPnL - postUnrealized;
+            // Record as realized event (positive = profit, negative = loss)
+            this.circuitBreaker.recordPnL(realizedPnL);
+          }
+          // Also record fees as a separate realized loss
           const fee = ccxtOrder.fee?.cost ?? 0;
           if (fee > 0) {
-            this.circuitBreaker.recordPnL(-fee); // fees are always a loss
+            this.circuitBreaker.recordPnL(-fee);
           }
         } catch { /* best-effort */ }
       }
