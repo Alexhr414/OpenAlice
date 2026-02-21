@@ -233,13 +233,14 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
       // Record realized PnL for circuit breaker when a reduceOnly order fills
       if (status === 'filled' && order.reduceOnly) {
         try {
-          // Fetch fresh positions to update unrealized snapshot (no double-counting)
-          await this.getPositions(); // side-effect: updates circuitBreaker.updateUnrealizedPnL
-          // Also record the fill as a realized event (approximate: use fill value as proxy)
-          const fillPrice = ccxtOrder.average ?? ccxtOrder.price ?? 0;
-          const fillSize = ccxtOrder.filled ?? size;
-          // For reduceOnly, realized PnL is unknown without entry price; use unrealized as proxy
-          // The unrealized snapshot update above is the primary safety mechanism
+          // Fetch fresh positions to update unrealized snapshot
+          const freshPositions = await this.getPositions(); // side-effect: updates updateUnrealizedPnL
+          // Record realized PnL: use ccxt order cost as proxy (fee from the fill)
+          // Since we can't get entry price from order alone, use the fee as a conservative realized loss
+          const fee = ccxtOrder.fee?.cost ?? 0;
+          if (fee > 0) {
+            this.circuitBreaker.recordPnL(-fee); // fees are always a loss
+          }
         } catch { /* best-effort */ }
       }
 
