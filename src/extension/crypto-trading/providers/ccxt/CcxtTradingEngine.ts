@@ -6,6 +6,8 @@
  */
 
 import ccxt from 'ccxt';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import type { Exchange, Order as CcxtOrder } from 'ccxt';
 import type {
   ICryptoTradingEngine,
@@ -17,6 +19,10 @@ import type {
 } from '../../interfaces.js';
 import { SymbolMapper } from './symbol-map.js';
 
+// ==================== Hard Risk Limits ====================
+const MAX_LEVERAGE_HARD_LIMIT = 10;
+const MAX_POSITION_PCT = 0.15; // 15% of equity per position
+
 export interface CcxtEngineConfig {
   exchange: string;
   apiKey: string;
@@ -27,6 +33,8 @@ export interface CcxtEngineConfig {
   defaultMarketType: 'spot' | 'swap';
   allowedSymbols: string[];
   options?: Record<string, unknown>;
+  /** Max leverage override (capped at MAX_LEVERAGE_HARD_LIMIT=10). */
+  maxLeverage?: number;
 }
 
 export class CcxtTradingEngine implements ICryptoTradingEngine {
@@ -34,8 +42,9 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
   private symbolMapper: SymbolMapper;
   private initialized = false;
 
-  // Maintain orderId -> ccxtSymbol mapping for cancelOrder
+  // Maintain orderId -> ccxtSymbol mapping for cancelOrder (persisted to disk)
   private orderSymbolCache = new Map<string, string>();
+  private static readonly CACHE_PATH = join(process.cwd(), 'data', 'order-symbol-cache.json');
 
   constructor(private config: CcxtEngineConfig) {
     const exchanges = ccxt as unknown as Record<string, new (opts: Record<string, unknown>) => Exchange>;
@@ -65,7 +74,28 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
     );
   }
 
+  /** Persist order-symbol cache to disk. */
+  private async saveCache(): Promise<void> {
+    try {
+      await mkdir(dirname(CcxtTradingEngine.CACHE_PATH), { recursive: true });
+      const obj = Object.fromEntries(this.orderSymbolCache);
+      await writeFile(CcxtTradingEngine.CACHE_PATH, JSON.stringify(obj, null, 2));
+    } catch { /* best-effort */ }
+  }
+
+  /** Restore order-symbol cache from disk. */
+  private async restoreCache(): Promise<void> {
+    try {
+      const raw = await readFile(CcxtTradingEngine.CACHE_PATH, 'utf-8');
+      const obj = JSON.parse(raw) as Record<string, string>;
+      for (const [k, v] of Object.entries(obj)) {
+        this.orderSymbolCache.set(k, v);
+      }
+    } catch { /* no cache yet */ }
+  }
+
   async init(): Promise<void> {
+    await this.restoreCache();
     await this.exchange.loadMarkets();
     this.symbolMapper.init(this.exchange.markets as unknown as Record<string, {
       symbol: string;
@@ -101,13 +131,48 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
       return { success: false, error: 'Either size or usd_size must be provided' };
     }
 
+    // Enforce position size limit (% of equity)
     try {
+      const account = await this.exchange.fetchBalance();
+      const bal = account as unknown as Record<string, Record<string, unknown>>;
+      const equity = parseFloat(String(bal['total']?.['USDT'] ?? bal['total']?.['USD'] ?? 0));
+      if (equity > 0) {
+        const ticker = await this.exchange.fetchTicker(ccxtSymbol);
+        const price = order.price ?? ticker.last ?? 0;
+        const positionValue = size * price;
+        const maxValue = equity * MAX_POSITION_PCT;
+        if (positionValue > maxValue) {
+          return {
+            success: false,
+            error: `Position value $${positionValue.toFixed(2)} exceeds ${(MAX_POSITION_PCT * 100).toFixed(0)}% of equity ($${maxValue.toFixed(2)}). Order rejected.`,
+          };
+        }
+      }
+    } catch {
+      // If we can't check equity, log warning but allow order (exchange may not support fetchBalance)
+      console.warn('CcxtTradingEngine: Could not verify position size limit (fetchBalance failed)');
+    }
+
+    try {
+      // Enforce leverage hard limit (non-bypassable)
+      const maxLev = Math.min(this.config.maxLeverage ?? MAX_LEVERAGE_HARD_LIMIT, MAX_LEVERAGE_HARD_LIMIT);
+      if (order.leverage && order.leverage > maxLev) {
+        return {
+          success: false,
+          error: `Leverage ${order.leverage}x exceeds hard limit of ${maxLev}x. Order rejected.`,
+        };
+      }
+
       // Futures: set leverage first
       if (order.leverage && order.leverage > 1) {
         try {
           await this.exchange.setLeverage(order.leverage, ccxtSymbol);
-        } catch {
-          // Some exchanges don't support setLeverage or leverage is already set; ignore
+        } catch (leverageErr) {
+          // BLOCKING: setLeverage failure must prevent order placement
+          return {
+            success: false,
+            error: `Failed to set leverage to ${order.leverage}x: ${leverageErr instanceof Error ? leverageErr.message : String(leverageErr)}. Order rejected for safety.`,
+          };
         }
       }
 
@@ -123,9 +188,10 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
         params,
       );
 
-      // Cache orderId -> symbol mapping
+      // Cache orderId -> symbol mapping (persisted)
       if (ccxtOrder.id) {
         this.orderSymbolCache.set(ccxtOrder.id, ccxtSymbol);
+        this.saveCache().catch(() => {});
       }
 
       const status = this.mapOrderStatus(ccxtOrder.status);
