@@ -52,11 +52,11 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
   readonly circuitBreaker = new DailyLossCircuitBreaker();
 
   /**
-   * Last known unrealized PnL snapshot per symbol (for realized PnL diff calculation).
-   * Updated on every getPositions() call. When a position disappears or shrinks,
-   * the diff is recorded as realized PnL.
+   * Last known position state per symbol:side (for realized PnL diff calculation).
+   * Tracks both size and unrealized PnL. Realized PnL is only recorded when
+   * position SIZE actually decreases (not from price movement alone).
    */
-  private lastUnrealizedBySymbol = new Map<string, number>();
+  private lastPositionState = new Map<string, { size: number; unrealizedPnL: number }>();
 
   constructor(private config: CcxtEngineConfig) {
     const exchanges = ccxt as unknown as Record<string, new (opts: Record<string, unknown>) => Exchange>;
@@ -289,29 +289,39 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
       });
     }
 
-    // Per-symbol+side realized PnL diff: detect when positions close, shrink, or flip
-    // Key by symbol:side to handle hedge mode (separate long/short legs)
-    const currentByKey = new Map<string, number>();
+    // Per-symbol:side realized PnL tracking (hedge-mode safe)
+    // Only record realized PnL when position SIZE actually decreases — not from price movement
+    const currentState = new Map<string, { size: number; unrealizedPnL: number }>();
     for (const p of result) {
       const key = `${p.symbol}:${p.side}`;
-      currentByKey.set(key, (currentByKey.get(key) ?? 0) + p.unrealizedPnL);
+      const existing = currentState.get(key);
+      if (existing) {
+        existing.size += p.size;
+        existing.unrealizedPnL += p.unrealizedPnL;
+      } else {
+        currentState.set(key, { size: p.size, unrealizedPnL: p.unrealizedPnL });
+      }
     }
-    // For each previously tracked position, if it closed or shrunk,
-    // record the delta as realized PnL (handles both full and partial closes)
-    for (const [key, prevUnrealized] of this.lastUnrealizedBySymbol) {
-      const curUnrealized = currentByKey.get(key) ?? 0;
-      // Position fully closed: all prev unrealized became realized
-      // Position partially closed: diff = what was realized
-      if (!currentByKey.has(key) && prevUnrealized !== 0) {
-        // Full close
-        this.circuitBreaker.recordPnL(prevUnrealized);
-      } else if (currentByKey.has(key) && Math.abs(curUnrealized) < Math.abs(prevUnrealized)) {
-        // Partial close: realized = prev - current
-        this.circuitBreaker.recordPnL(prevUnrealized - curUnrealized);
+    // Detect actual position size reduction → record realized PnL
+    for (const [key, prev] of this.lastPositionState) {
+      const cur = currentState.get(key);
+      if (!cur) {
+        // Position fully closed: all prev unrealized became realized
+        if (prev.unrealizedPnL !== 0) {
+          this.circuitBreaker.recordPnL(prev.unrealizedPnL);
+        }
+      } else if (cur.size < prev.size && prev.size > 0) {
+        // Position size actually decreased (partial close, not just price movement)
+        // Pro-rate the realized PnL by the fraction closed
+        const fractionClosed = (prev.size - cur.size) / prev.size;
+        const realizedPnL = prev.unrealizedPnL * fractionClosed;
+        if (realizedPnL !== 0) {
+          this.circuitBreaker.recordPnL(realizedPnL);
+        }
       }
     }
     // Update snapshot for next diff
-    this.lastUnrealizedBySymbol = currentByKey;
+    this.lastPositionState = currentState;
 
     // Update total unrealized PnL snapshot (replaces previous, does NOT accumulate)
     const totalUnrealizedPnL = result.reduce((sum, p) => sum + p.unrealizedPnL, 0);
