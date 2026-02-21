@@ -18,6 +18,7 @@ import type {
   CryptoAccountInfo,
 } from '../../interfaces.js';
 import { SymbolMapper } from './symbol-map.js';
+import { DailyLossCircuitBreaker } from '../../circuit-breaker.js';
 
 // ==================== Hard Risk Limits ====================
 const MAX_LEVERAGE_HARD_LIMIT = 10;
@@ -45,6 +46,10 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
   // Maintain orderId -> ccxtSymbol mapping for cancelOrder (persisted to disk)
   private orderSymbolCache = new Map<string, string>();
   private static readonly CACHE_PATH = join(process.cwd(), 'data', 'order-symbol-cache.json');
+  private static readonly MAX_CACHE_ENTRIES = 10_000;
+
+  /** Circuit breaker — wired into placeOrder. */
+  readonly circuitBreaker = new DailyLossCircuitBreaker();
 
   constructor(private config: CcxtEngineConfig) {
     const exchanges = ccxt as unknown as Record<string, new (opts: Record<string, unknown>) => Exchange>;
@@ -74,22 +79,39 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
     );
   }
 
-  /** Persist order-symbol cache to disk. */
+  /** Persist order-symbol cache to disk (pruned to MAX_CACHE_ENTRIES). */
   private async saveCache(): Promise<void> {
     try {
+      // Prune oldest entries if over limit
+      if (this.orderSymbolCache.size > CcxtTradingEngine.MAX_CACHE_ENTRIES) {
+        const excess = this.orderSymbolCache.size - CcxtTradingEngine.MAX_CACHE_ENTRIES;
+        const iter = this.orderSymbolCache.keys();
+        for (let i = 0; i < excess; i++) {
+          const key = iter.next().value;
+          if (key) this.orderSymbolCache.delete(key);
+        }
+      }
       await mkdir(dirname(CcxtTradingEngine.CACHE_PATH), { recursive: true });
       const obj = Object.fromEntries(this.orderSymbolCache);
       await writeFile(CcxtTradingEngine.CACHE_PATH, JSON.stringify(obj, null, 2));
     } catch { /* best-effort */ }
   }
 
-  /** Restore order-symbol cache from disk. */
+  /** Restore order-symbol cache from disk (with validation + size cap). */
   private async restoreCache(): Promise<void> {
     try {
       const raw = await readFile(CcxtTradingEngine.CACHE_PATH, 'utf-8');
-      const obj = JSON.parse(raw) as Record<string, string>;
-      for (const [k, v] of Object.entries(obj)) {
-        this.orderSymbolCache.set(k, v);
+      if (raw.length > 5 * 1024 * 1024) return; // reject files > 5MB
+      const obj = JSON.parse(raw);
+      if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return;
+      const entries = Object.entries(obj);
+      // Only load last MAX_CACHE_ENTRIES entries
+      const start = Math.max(0, entries.length - CcxtTradingEngine.MAX_CACHE_ENTRIES);
+      for (let i = start; i < entries.length; i++) {
+        const [k, v] = entries[i];
+        if (typeof k === 'string' && typeof v === 'string' && k.length < 200 && v.length < 200) {
+          this.orderSymbolCache.set(k, v);
+        }
       }
     } catch { /* no cache yet */ }
   }
@@ -113,6 +135,18 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
 
   async placeOrder(order: CryptoPlaceOrderRequest, _currentTime?: Date): Promise<CryptoOrderResult> {
     this.ensureInit();
+
+    // Circuit breaker gate — check before any order
+    try {
+      const account = await this.getAccount();
+      const cbResult = this.circuitBreaker.check(account.equity);
+      if (!cbResult.allowed) {
+        return { success: false, error: `Circuit breaker: ${cbResult.reason}` };
+      }
+    } catch {
+      // If we can't get equity for circuit breaker, fail-closed
+      return { success: false, error: 'Circuit breaker: cannot fetch account equity. Order blocked (fail-closed).' };
+    }
 
     const ccxtSymbol = this.symbolMapper.toCcxt(order.symbol);
     let size = order.size;
@@ -333,6 +367,15 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
     newLeverage: number,
   ): Promise<{ success: boolean; error?: string }> {
     this.ensureInit();
+
+    // Enforce leverage hard limit (same as placeOrder — non-bypassable)
+    const maxLev = Math.min(this.config.maxLeverage ?? MAX_LEVERAGE_HARD_LIMIT, MAX_LEVERAGE_HARD_LIMIT);
+    if (newLeverage > maxLev) {
+      return {
+        success: false,
+        error: `Leverage ${newLeverage}x exceeds hard limit of ${maxLev}x. Adjustment rejected.`,
+      };
+    }
 
     const ccxtSymbol = this.symbolMapper.toCcxt(symbol);
     try {

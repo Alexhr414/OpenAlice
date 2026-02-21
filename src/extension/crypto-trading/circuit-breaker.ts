@@ -61,7 +61,15 @@ export class DailyLossCircuitBreaker {
     this.pruneOldEntries();
     const totalPnL = this.pnlLog.reduce((sum, e) => sum + e.pnl, 0);
 
-    if (currentEquity > 0 && totalPnL < 0) {
+    // Fail-closed: if equity is zero/missing, block trading (cannot assess risk)
+    if (currentEquity <= 0) {
+      return {
+        allowed: false,
+        reason: `Equity is ${currentEquity}. Cannot assess risk — trading blocked (fail-closed).`,
+      };
+    }
+
+    if (totalPnL < 0) {
       const lossPct = Math.abs(totalPnL) / currentEquity;
       if (lossPct >= this.config.maxDailyLossPct) {
         this.trippedAt = this.now();

@@ -285,10 +285,10 @@ async function main() {
 
   if (process.env.TELEGRAM_BOT_TOKEN) {
     const chatIds = process.env.TELEGRAM_CHAT_ID
-      ? process.env.TELEGRAM_CHAT_ID.split(',').map(Number)
+      ? process.env.TELEGRAM_CHAT_ID.split(',').map(Number).filter(Number.isFinite)
       : [];
     if (chatIds.length === 0) {
-      console.error('FATAL: TELEGRAM_BOT_TOKEN set but TELEGRAM_CHAT_ID is empty. Refusing to start Telegram connector without whitelist.');
+      console.error('FATAL: TELEGRAM_BOT_TOKEN set but TELEGRAM_CHAT_ID is empty or contains invalid IDs. Refusing to start Telegram connector without valid whitelist.');
       process.exit(1);
     }
     plugins.push(new TelegramPlugin({

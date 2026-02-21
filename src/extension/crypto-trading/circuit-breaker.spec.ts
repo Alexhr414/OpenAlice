@@ -61,8 +61,14 @@ describe('DailyLossCircuitBreaker', () => {
     expect(cb.rollingPnL).toBe(-10);
   });
 
-  it('handles zero equity gracefully', () => {
-    cb.recordPnL(-100);
-    expect(cb.check(0).allowed).toBe(true); // can't compute %, allow
+  it('blocks trading when equity is zero (fail-closed)', () => {
+    const result = cb.check(0);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('fail-closed');
+  });
+
+  it('blocks trading when equity is negative (fail-closed)', () => {
+    const result = cb.check(-100);
+    expect(result.allowed).toBe(false);
   });
 });
