@@ -6,6 +6,8 @@
  */
 
 import ccxt from 'ccxt';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import type { Exchange, Order as CcxtOrder } from 'ccxt';
 import type {
   ICryptoTradingEngine,
@@ -16,6 +18,11 @@ import type {
   CryptoAccountInfo,
 } from '../../interfaces.js';
 import { SymbolMapper } from './symbol-map.js';
+import { DailyLossCircuitBreaker } from '../../circuit-breaker.js';
+
+// ==================== Hard Risk Limits ====================
+const MAX_LEVERAGE_HARD_LIMIT = 10;
+const MAX_POSITION_PCT = 0.15; // 15% of equity per position
 
 export interface CcxtEngineConfig {
   exchange: string;
@@ -27,6 +34,8 @@ export interface CcxtEngineConfig {
   defaultMarketType: 'spot' | 'swap';
   allowedSymbols: string[];
   options?: Record<string, unknown>;
+  /** Max leverage override (capped at MAX_LEVERAGE_HARD_LIMIT=10). */
+  maxLeverage?: number;
 }
 
 export class CcxtTradingEngine implements ICryptoTradingEngine {
@@ -34,8 +43,20 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
   private symbolMapper: SymbolMapper;
   private initialized = false;
 
-  // Maintain orderId -> ccxtSymbol mapping for cancelOrder
+  // Maintain orderId -> ccxtSymbol mapping for cancelOrder (persisted to disk)
   private orderSymbolCache = new Map<string, string>();
+  private static readonly CACHE_PATH = join(process.cwd(), 'data', 'order-symbol-cache.json');
+  private static readonly MAX_CACHE_ENTRIES = 10_000;
+
+  /** Circuit breaker — wired into placeOrder. */
+  readonly circuitBreaker = new DailyLossCircuitBreaker();
+
+  /**
+   * Last known position state per symbol:side (for realized PnL diff calculation).
+   * Tracks both size and unrealized PnL. Realized PnL is only recorded when
+   * position SIZE actually decreases (not from price movement alone).
+   */
+  private lastPositionState = new Map<string, { size: number; unrealizedPnL: number }>();
 
   constructor(private config: CcxtEngineConfig) {
     const exchanges = ccxt as unknown as Record<string, new (opts: Record<string, unknown>) => Exchange>;
@@ -65,7 +86,45 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
     );
   }
 
+  /** Persist order-symbol cache to disk (pruned to MAX_CACHE_ENTRIES). */
+  private async saveCache(): Promise<void> {
+    try {
+      // Prune oldest entries if over limit
+      if (this.orderSymbolCache.size > CcxtTradingEngine.MAX_CACHE_ENTRIES) {
+        const excess = this.orderSymbolCache.size - CcxtTradingEngine.MAX_CACHE_ENTRIES;
+        const iter = this.orderSymbolCache.keys();
+        for (let i = 0; i < excess; i++) {
+          const key = iter.next().value;
+          if (key) this.orderSymbolCache.delete(key);
+        }
+      }
+      await mkdir(dirname(CcxtTradingEngine.CACHE_PATH), { recursive: true });
+      const obj = Object.fromEntries(this.orderSymbolCache);
+      await writeFile(CcxtTradingEngine.CACHE_PATH, JSON.stringify(obj, null, 2));
+    } catch { /* best-effort */ }
+  }
+
+  /** Restore order-symbol cache from disk (with validation + size cap). */
+  private async restoreCache(): Promise<void> {
+    try {
+      const raw = await readFile(CcxtTradingEngine.CACHE_PATH, 'utf-8');
+      if (raw.length > 5 * 1024 * 1024) return; // reject files > 5MB
+      const obj = JSON.parse(raw);
+      if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return;
+      const entries = Object.entries(obj);
+      // Only load last MAX_CACHE_ENTRIES entries
+      const start = Math.max(0, entries.length - CcxtTradingEngine.MAX_CACHE_ENTRIES);
+      for (let i = start; i < entries.length; i++) {
+        const [k, v] = entries[i];
+        if (typeof k === 'string' && typeof v === 'string' && k.length < 200 && v.length < 200) {
+          this.orderSymbolCache.set(k, v);
+        }
+      }
+    } catch { /* no cache yet */ }
+  }
+
   async init(): Promise<void> {
+    await this.restoreCache();
     await this.exchange.loadMarkets();
     this.symbolMapper.init(this.exchange.markets as unknown as Record<string, {
       symbol: string;
@@ -84,6 +143,18 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
   async placeOrder(order: CryptoPlaceOrderRequest, _currentTime?: Date): Promise<CryptoOrderResult> {
     this.ensureInit();
 
+    // Circuit breaker gate — check before any order
+    try {
+      const account = await this.getAccount();
+      const cbResult = this.circuitBreaker.check(account.equity);
+      if (!cbResult.allowed) {
+        return { success: false, error: `Circuit breaker: ${cbResult.reason}` };
+      }
+    } catch {
+      // If we can't get equity for circuit breaker, fail-closed
+      return { success: false, error: 'Circuit breaker: cannot fetch account equity. Order blocked (fail-closed).' };
+    }
+
     const ccxtSymbol = this.symbolMapper.toCcxt(order.symbol);
     let size = order.size;
 
@@ -101,13 +172,48 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
       return { success: false, error: 'Either size or usd_size must be provided' };
     }
 
+    // Enforce position size limit (% of equity)
     try {
+      const account = await this.exchange.fetchBalance();
+      const bal = account as unknown as Record<string, Record<string, unknown>>;
+      const equity = parseFloat(String(bal['total']?.['USDT'] ?? bal['total']?.['USD'] ?? 0));
+      if (equity > 0) {
+        const ticker = await this.exchange.fetchTicker(ccxtSymbol);
+        const price = order.price ?? ticker.last ?? 0;
+        const positionValue = size * price;
+        const maxValue = equity * MAX_POSITION_PCT;
+        if (positionValue > maxValue) {
+          return {
+            success: false,
+            error: `Position value $${positionValue.toFixed(2)} exceeds ${(MAX_POSITION_PCT * 100).toFixed(0)}% of equity ($${maxValue.toFixed(2)}). Order rejected.`,
+          };
+        }
+      }
+    } catch {
+      // If we can't check equity, log warning but allow order (exchange may not support fetchBalance)
+      console.warn('CcxtTradingEngine: Could not verify position size limit (fetchBalance failed)');
+    }
+
+    try {
+      // Enforce leverage hard limit (non-bypassable)
+      const maxLev = Math.min(this.config.maxLeverage ?? MAX_LEVERAGE_HARD_LIMIT, MAX_LEVERAGE_HARD_LIMIT);
+      if (order.leverage && order.leverage > maxLev) {
+        return {
+          success: false,
+          error: `Leverage ${order.leverage}x exceeds hard limit of ${maxLev}x. Order rejected.`,
+        };
+      }
+
       // Futures: set leverage first
       if (order.leverage && order.leverage > 1) {
         try {
           await this.exchange.setLeverage(order.leverage, ccxtSymbol);
-        } catch {
-          // Some exchanges don't support setLeverage or leverage is already set; ignore
+        } catch (leverageErr) {
+          // BLOCKING: setLeverage failure must prevent order placement
+          return {
+            success: false,
+            error: `Failed to set leverage to ${order.leverage}x: ${leverageErr instanceof Error ? leverageErr.message : String(leverageErr)}. Order rejected for safety.`,
+          };
         }
       }
 
@@ -123,12 +229,23 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
         params,
       );
 
-      // Cache orderId -> symbol mapping
+      // Cache orderId -> symbol mapping (persisted)
       if (ccxtOrder.id) {
         this.orderSymbolCache.set(ccxtOrder.id, ccxtSymbol);
+        this.saveCache().catch(() => {});
       }
 
       const status = this.mapOrderStatus(ccxtOrder.status);
+
+      // After any filled order, refresh positions to update realized PnL tracking
+      if (status === 'filled') {
+        // Record fees as realized loss (always, even if position fetch fails)
+        const fee = ccxtOrder.fee?.cost ?? 0;
+        if (fee > 0) this.circuitBreaker.recordPnL(-fee);
+        try {
+          await this.getPositions(); // triggers per-symbol realized PnL diff + unrealized snapshot update
+        } catch { /* best-effort position refresh */ }
+      }
 
       return {
         success: true,
@@ -171,6 +288,44 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
         positionValue: size * parseFloat(String(p.markPrice ?? 0)),
       });
     }
+
+    // Per-symbol:side realized PnL tracking (hedge-mode safe)
+    // Only record realized PnL when position SIZE actually decreases — not from price movement
+    const currentState = new Map<string, { size: number; unrealizedPnL: number }>();
+    for (const p of result) {
+      const key = `${p.symbol}:${p.side}`;
+      const existing = currentState.get(key);
+      if (existing) {
+        existing.size += p.size;
+        existing.unrealizedPnL += p.unrealizedPnL;
+      } else {
+        currentState.set(key, { size: p.size, unrealizedPnL: p.unrealizedPnL });
+      }
+    }
+    // Detect actual position size reduction → record realized PnL
+    for (const [key, prev] of this.lastPositionState) {
+      const cur = currentState.get(key);
+      if (!cur) {
+        // Position fully closed: all prev unrealized became realized
+        if (prev.unrealizedPnL !== 0) {
+          this.circuitBreaker.recordPnL(prev.unrealizedPnL);
+        }
+      } else if (cur.size < prev.size && prev.size > 0) {
+        // Position size actually decreased (partial close, not just price movement)
+        // Pro-rate the realized PnL by the fraction closed
+        const fractionClosed = (prev.size - cur.size) / prev.size;
+        const realizedPnL = prev.unrealizedPnL * fractionClosed;
+        if (realizedPnL !== 0) {
+          this.circuitBreaker.recordPnL(realizedPnL);
+        }
+      }
+    }
+    // Update snapshot for next diff
+    this.lastPositionState = currentState;
+
+    // Update total unrealized PnL snapshot (replaces previous, does NOT accumulate)
+    const totalUnrealizedPnL = result.reduce((sum, p) => sum + p.unrealizedPnL, 0);
+    this.circuitBreaker.updateUnrealizedPnL(totalUnrealizedPnL);
 
     return result;
   }
@@ -267,6 +422,15 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
     newLeverage: number,
   ): Promise<{ success: boolean; error?: string }> {
     this.ensureInit();
+
+    // Enforce leverage hard limit (same as placeOrder — non-bypassable)
+    const maxLev = Math.min(this.config.maxLeverage ?? MAX_LEVERAGE_HARD_LIMIT, MAX_LEVERAGE_HARD_LIMIT);
+    if (newLeverage > maxLev) {
+      return {
+        success: false,
+        error: `Leverage ${newLeverage}x exceeds hard limit of ${maxLev}x. Adjustment rejected.`,
+      };
+    }
 
     const ccxtSymbol = this.symbolMapper.toCcxt(symbol);
     try {
