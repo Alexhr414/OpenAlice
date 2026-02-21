@@ -19,6 +19,7 @@ import type {
 } from '../../interfaces.js';
 import { SymbolMapper } from './symbol-map.js';
 import { DailyLossCircuitBreaker } from '../../circuit-breaker.js';
+import { ExecutionMetricsCollector, type OrderMetric } from '../../execution-metrics.js';
 
 // ==================== Hard Risk Limits ====================
 const MAX_LEVERAGE_HARD_LIMIT = 10;
@@ -50,6 +51,9 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
 
   /** Circuit breaker — wired into placeOrder. */
   readonly circuitBreaker = new DailyLossCircuitBreaker();
+
+  /** Execution metrics collector for G3 validation. */
+  readonly executionMetrics = new ExecutionMetricsCollector();
 
   /**
    * Last known position state per symbol:side (for realized PnL diff calculation).
@@ -220,6 +224,16 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
       const params: Record<string, unknown> = {};
       if (order.reduceOnly) params.reduceOnly = true;
 
+      // --- G3 metrics: capture pre-order price for slippage ---
+      let expectedPrice = order.price ?? 0;
+      if (order.type === 'market' && !expectedPrice) {
+        try {
+          const preTicker = await this.exchange.fetchTicker(ccxtSymbol);
+          expectedPrice = preTicker.last ?? 0;
+        } catch { /* best-effort */ }
+      }
+
+      const orderStartMs = Date.now();
       const ccxtOrder = await this.exchange.createOrder(
         ccxtSymbol,
         order.type,
@@ -228,6 +242,7 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
         order.type === 'limit' ? order.price : undefined,
         params,
       );
+      const latencyMs = Date.now() - orderStartMs;
 
       // Cache orderId -> symbol mapping (persisted)
       if (ccxtOrder.id) {
@@ -236,6 +251,25 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
       }
 
       const status = this.mapOrderStatus(ccxtOrder.status);
+      const filledPrice = status === 'filled' ? (ccxtOrder.average ?? ccxtOrder.price ?? null) : null;
+
+      // --- G3 metrics: record execution metric ---
+      const slippageBps = (order.type === 'market' && filledPrice && expectedPrice > 0)
+        ? ((filledPrice - expectedPrice) / expectedPrice) * 10000 * (order.side === 'buy' ? 1 : -1)
+        : null;
+      this.executionMetrics.record({
+        timestamp: new Date().toISOString(),
+        symbol: order.symbol,
+        side: order.side,
+        type: order.type,
+        latencyMs,
+        expectedPrice,
+        filledPrice,
+        slippageBps,
+        success: true,
+        orderId: ccxtOrder.id,
+        filledSize: status === 'filled' ? (ccxtOrder.filled ?? undefined) : undefined,
+      });
 
       // After any filled order, refresh positions to update realized PnL tracking
       if (status === 'filled') {
@@ -251,10 +285,23 @@ export class CcxtTradingEngine implements ICryptoTradingEngine {
         success: true,
         orderId: ccxtOrder.id,
         message: `Order ${ccxtOrder.id} ${status}`,
-        filledPrice: status === 'filled' ? (ccxtOrder.average ?? ccxtOrder.price ?? undefined) : undefined,
+        filledPrice: status === 'filled' ? (filledPrice ?? undefined) : undefined,
         filledSize: status === 'filled' ? (ccxtOrder.filled ?? undefined) : undefined,
       };
     } catch (err) {
+      // --- G3 metrics: record failure ---
+      this.executionMetrics.record({
+        timestamp: new Date().toISOString(),
+        symbol: order.symbol,
+        side: order.side,
+        type: order.type,
+        latencyMs: 0,
+        expectedPrice: 0,
+        filledPrice: null,
+        slippageBps: null,
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return {
         success: false,
         error: err instanceof Error ? err.message : String(err),
